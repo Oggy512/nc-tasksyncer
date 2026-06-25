@@ -162,7 +162,7 @@ Das Image enthält nur Python, die gepinnten Abhängigkeiten und das Synchronisa
 
 ## Synchronisationsziele
 
-Version 0.2.0 unterstützt drei logisch getrennte Ziele.
+Version 0.2.1 unterstützt drei logisch getrennte Ziele.
 
 | Ziel-ID | Zweck | Standard |
 |---|---|---:|
@@ -535,7 +535,7 @@ Das Script verwaltet ausschließlich Termine mit:
 source=nextcloud-task-google-calendar-sync
 ```
 
-Zusätzlich trennt Version 0.2.0 die Termine über `syncTarget`. Vor dem ersten Produktivstart nach einem Update sollte das Log im Dry-Run geprüft werden.
+Zusätzlich trennt Version 0.2.1 die Termine über `syncTarget`. Vor dem ersten Produktivstart nach einem Update sollte das Log im Dry-Run geprüft werden.
 
 ## Sicherheitskonzept
 

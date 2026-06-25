@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Project: Nextcloud Task to Google Calendar Sync
-Version: 0.2.0
+Version: 0.2.1
 Synopsis:
     One-way synchronizes VTODO tasks from one shared and up to two optional
     personal Nextcloud CalDAV task lists into corresponding Google Calendars.
@@ -12,7 +12,7 @@ Description:
     Mapping is stored in Google Calendar extendedProperties.private, so no
     separate database is required.
 
-Supported behavior in version 0.2.0:
+Supported behavior in version 0.2.1:
     - Reads one shared and up to two optional personal Nextcloud CalDAV task lists.
     - Uses an independent Nextcloud URL/login and Google Calendar per sync target.
     - Parses VTODO entries.
@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -54,7 +55,7 @@ from icalendar import Calendar
 
 APP_NAME = "nextcloud-task-sync"
 APP_SOURCE = "nextcloud-task-google-calendar-sync"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 
 NS = {
     "d": "DAV:",
@@ -636,22 +637,25 @@ def build_event_plans(task: TaskItem, config: Config, target: SyncTarget, local_
 
 
 def event_body_from_plan(plan: EventPlan, config: Config) -> dict:
+    private_properties = {
+        "source": APP_SOURCE,
+        "sourceKey": plan.source_key,
+        "nextcloudTaskUid": plan.task_uid,
+        "syncTarget": plan.target_id,
+        "syncTargetName": plan.target_name,
+        "managedBy": APP_NAME,
+    }
+    # Google Calendar may omit empty extended properties from API responses.
+    # Do not send empty values because they would otherwise cause endless PATCH loops.
+    if plan.recurrence_instance:
+        private_properties["recurrenceInstance"] = plan.recurrence_instance
+
     return {
         "summary": plan.summary,
         "description": plan.description,
         "start": {"dateTime": plan.start.isoformat()},
         "end": {"dateTime": plan.end.isoformat()},
-        "extendedProperties": {
-            "private": {
-                "source": APP_SOURCE,
-                "sourceKey": plan.source_key,
-                "nextcloudTaskUid": plan.task_uid,
-                "syncTarget": plan.target_id,
-                "syncTargetName": plan.target_name,
-                "recurrenceInstance": plan.recurrence_instance or "",
-                "managedBy": APP_NAME,
-            }
-        },
+        "extendedProperties": {"private": private_properties},
         "reminders": {
             "useDefault": False,
             "overrides": [
@@ -693,17 +697,96 @@ def list_managed_google_events(service, target: SyncTarget) -> Dict[str, dict]:
     return events_by_key
 
 
+def normalize_event_datetime(value: Optional[str]) -> Optional[str]:
+    """Normalize RFC3339 timestamps to an absolute UTC instant for comparison."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.isoformat(timespec="seconds")
+        return parsed.astimezone(tz.UTC).isoformat(timespec="seconds")
+    except ValueError:
+        # Preserve an unparseable value so a real mismatch still triggers an update.
+        return value
+
+
+def normalize_event_side(value: dict) -> dict:
+    """Keep only semantic fields managed by this application."""
+    if not value:
+        return {}
+    if value.get("dateTime"):
+        return {"dateTime": normalize_event_datetime(value.get("dateTime"))}
+    if value.get("date"):
+        return {"date": value.get("date")}
+    return {}
+
+
+def normalize_managed_description(value: str) -> str:
+    """Ignore the application version in the generated audit line during comparison.
+
+    A software update alone must not rewrite every calendar event and trigger
+    change notifications. The version is refreshed naturally when another
+    semantic task field changes.
+    """
+    if not value:
+        return ""
+    return re.sub(
+        rf"(?m)^Sync application: {re.escape(APP_SOURCE)}(?:\s+\S+)?$",
+        f"Sync application: {APP_SOURCE}",
+        value,
+    )
+
+
+def normalize_reminders(value: dict) -> dict:
+    if not value:
+        return {"useDefault": True, "overrides": []}
+    overrides = []
+    for item in value.get("overrides", []) or []:
+        overrides.append(
+            {
+                "method": str(item.get("method", "")),
+                "minutes": int(item.get("minutes", 0)),
+            }
+        )
+    overrides.sort(key=lambda item: (item["method"], item["minutes"]))
+    return {
+        "useDefault": bool(value.get("useDefault", False)),
+        "overrides": overrides,
+    }
+
+
+def comparable_event(value: dict, desired_private_keys: Optional[Set[str]] = None) -> dict:
+    private = value.get("extendedProperties", {}).get("private", {}) or {}
+    if desired_private_keys is not None:
+        private = {key: private.get(key) for key in desired_private_keys}
+    # Treat absent and empty private values as equivalent. Google may discard empty values.
+    private = {key: str(val) for key, val in private.items() if val not in {None, ""}}
+
+    return {
+        "summary": value.get("summary", ""),
+        "description": normalize_managed_description(value.get("description", "")),
+        "start": normalize_event_side(value.get("start", {})),
+        "end": normalize_event_side(value.get("end", {})),
+        "reminders": normalize_reminders(value.get("reminders", {})),
+        "private": private,
+    }
+
+
+def event_differences(existing: dict, desired: dict) -> List[str]:
+    desired_private = desired.get("extendedProperties", {}).get("private", {}) or {}
+    desired_private_keys = set(desired_private.keys())
+    normalized_existing = comparable_event(existing, desired_private_keys)
+    normalized_desired = comparable_event(desired, desired_private_keys)
+    return [
+        key
+        for key in normalized_desired
+        if normalized_existing.get(key) != normalized_desired.get(key)
+    ]
+
+
 def equivalent_event(existing: dict, desired: dict) -> bool:
-    keys = ["summary", "description", "start", "end", "reminders"]
-    for key in keys:
-        if existing.get(key) != desired.get(key):
-            return False
-    existing_private = existing.get("extendedProperties", {}).get("private", {})
-    desired_private = desired.get("extendedProperties", {}).get("private", {})
-    for key, value in desired_private.items():
-        if existing_private.get(key) != value:
-            return False
-    return True
+    return not event_differences(existing, desired)
 
 
 def create_event(service, config: Config, target: SyncTarget, body: dict) -> None:
@@ -780,10 +863,22 @@ def sync_target_once(config: Config, target: SyncTarget, service) -> None:
 
             if existing is None:
                 create_event(service, config, target, body)
-            elif not equivalent_event(existing, body):
-                patch_event(service, config, target, existing["id"], body)
             else:
-                logging.debug("[%s] Event already up to date for source key %s", target.target_id, plan.source_key)
+                differences = event_differences(existing, body)
+                if differences:
+                    logging.info(
+                        "[%s] Event differs for source key %s; changed fields: %s",
+                        target.target_id,
+                        plan.source_key,
+                        ", ".join(differences),
+                    )
+                    patch_event(service, config, target, existing["id"], body)
+                else:
+                    logging.debug(
+                        "[%s] Event already up to date for source key %s",
+                        target.target_id,
+                        plan.source_key,
+                    )
 
     for key, event in existing_events.items():
         if key not in planned_keys:

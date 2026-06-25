@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+- Fixed repeated Google Calendar PATCH operations for unchanged events.
+- Added canonical comparison for event timestamps, reminders and private extended properties.
+- Empty recurrence metadata is no longer written because Google may omit empty values in API responses.
+- Added changed-field logging before real event updates.
+- Application-version-only changes no longer rewrite all managed events.
+
 ## 0.2.0
 
 - Added one shared and up to two optional personal synchronization targets.
