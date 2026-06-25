@@ -10,6 +10,11 @@ Das Projekt unterstützt einen gemeinsamen Aufgabenpfad sowie bis zu zwei option
 
 Nextcloud bleibt das führende Aufgabensystem. Google Calendar dient als native Anzeige- und Erinnerungsebene auf Android, im Browser und in anderen Google-Calendar-Clients.
 
+## Idempotent updates
+
+Version 0.2.3 uses the `syncFingerprint` private Google Calendar event property as the primary update decision. Existing legacy events are migrated once. Subsequent runs skip PATCH requests when the fingerprint is unchanged.
+
+
 ## Version
 
 `0.2.0`
@@ -162,7 +167,7 @@ Das Image enthält nur Python, die gepinnten Abhängigkeiten und das Synchronisa
 
 ## Synchronisationsziele
 
-Version 0.2.1 unterstützt drei logisch getrennte Ziele.
+Version 0.2.3 unterstützt drei logisch getrennte Ziele.
 
 | Ziel-ID | Zweck | Standard |
 |---|---|---:|
@@ -535,7 +540,7 @@ Das Script verwaltet ausschließlich Termine mit:
 source=nextcloud-task-google-calendar-sync
 ```
 
-Zusätzlich trennt Version 0.2.1 die Termine über `syncTarget`. Vor dem ersten Produktivstart nach einem Update sollte das Log im Dry-Run geprüft werden.
+Zusätzlich trennt Version 0.2.3 die Termine über `syncTarget`. Vor dem ersten Produktivstart nach einem Update sollte das Log im Dry-Run geprüft werden.
 
 ## Sicherheitskonzept
 

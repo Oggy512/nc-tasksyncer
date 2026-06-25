@@ -1,32 +1,13 @@
 # Changelog
 
-## 0.2.1
+## 0.2.3
 
-- Fixed repeated Google Calendar PATCH operations for unchanged events.
-- Added canonical comparison for event timestamps, reminders and private extended properties.
-- Empty recurrence metadata is no longer written because Google may omit empty values in API responses.
-- Added changed-field logging before real event updates.
-- Application-version-only changes no longer rewrite all managed events.
+- Fixed a regression in 0.2.2 where the fingerprint-aware `equivalent_event()` function existed but was not used by the synchronization loop.
+- Existing events with a matching `syncFingerprint` are now skipped without a Google Calendar PATCH request.
+- Legacy events without `syncFingerprint` are patched once to add the fingerprint, then remain unchanged on later runs.
+- Logging now distinguishes legacy migration from a real fingerprint change.
 
-## 0.2.0
+## 0.2.2
 
-- Added one shared and up to two optional personal synchronization targets.
-- Each target supports an independent Nextcloud CalDAV URL, Nextcloud account and Google Calendar ID.
-- Added target isolation through Google Calendar private extended properties.
-- Added backward-compatible adoption of shared events created by version 0.1.x.
-- Added `requirements.in` and the Docker-based controlled update script.
-- Replaced the short README with full GitHub project documentation.
-
-## 0.1.2
-
-- Added status and priority mapping.
-- Added recurring-task expansion using RRULE, RDATE and EXDATE.
-
-## 0.1.1
-
-- Preserved VTODO due time in Google Calendar events.
-- Preserved due time when overdue events are moved to today.
-
-## 0.1.0
-
-- Initial one-way synchronization from one Nextcloud task list to one Google Calendar.
+- Added stable SHA-256 event fingerprints for idempotent synchronization.
+- Removed volatile Nextcloud `LAST-MODIFIED` data from generated event descriptions.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Project: Nextcloud Task to Google Calendar Sync
-Version: 0.2.1
+Version: 0.2.3
 Synopsis:
     One-way synchronizes VTODO tasks from one shared and up to two optional
     personal Nextcloud CalDAV task lists into corresponding Google Calendars.
@@ -12,7 +12,7 @@ Description:
     Mapping is stored in Google Calendar extendedProperties.private, so no
     separate database is required.
 
-Supported behavior in version 0.2.1:
+Supported behavior in version 0.2.3:
     - Reads one shared and up to two optional personal Nextcloud CalDAV task lists.
     - Uses an independent Nextcloud URL/login and Google Calendar per sync target.
     - Parses VTODO entries.
@@ -37,6 +37,8 @@ Known limitations:
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import os
 import re
 import sys
@@ -55,7 +57,7 @@ from icalendar import Calendar
 
 APP_NAME = "nextcloud-task-sync"
 APP_SOURCE = "nextcloud-task-google-calendar-sync"
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.3"
 
 NS = {
     "d": "DAV:",
@@ -552,8 +554,6 @@ def build_single_event_plan(
         lines.append(f"Recurrence instance: {recurrence_instance}")
     if task.rrule_text:
         lines.append(f"Recurrence rule: {task.rrule_text}")
-    if task.last_modified:
-        lines.append(f"Last modified: {task.last_modified}")
     if task.url:
         lines.append(f"Task URL: {task.url}")
     if task.description:
@@ -636,6 +636,29 @@ def build_event_plans(task: TaskItem, config: Config, target: SyncTarget, local_
     return plans
 
 
+def event_fingerprint(plan: EventPlan, config: Config) -> str:
+    """Return a stable fingerprint for the semantic event state managed by this app.
+
+    Google Calendar may normalize or omit individual response fields. The fingerprint
+    is stored as an extended property and is therefore used as the primary idempotency
+    check. It changes only when task content or relevant sync configuration changes.
+    """
+    payload = {
+        "sourceKey": plan.source_key,
+        "taskUid": plan.task_uid,
+        "targetId": plan.target_id,
+        "summary": plan.summary,
+        "description": normalize_managed_description(plan.description),
+        "start": normalize_event_datetime(plan.start.isoformat()),
+        "end": normalize_event_datetime(plan.end.isoformat()),
+        "recurrenceInstance": plan.recurrence_instance or "",
+        "reminderMinutes": config.reminder_minutes,
+        "eventDurationMinutes": config.event_duration_minutes,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def event_body_from_plan(plan: EventPlan, config: Config) -> dict:
     private_properties = {
         "source": APP_SOURCE,
@@ -644,6 +667,7 @@ def event_body_from_plan(plan: EventPlan, config: Config) -> dict:
         "syncTarget": plan.target_id,
         "syncTargetName": plan.target_name,
         "managedBy": APP_NAME,
+        "syncFingerprint": event_fingerprint(plan, config),
     }
     # Google Calendar may omit empty extended properties from API responses.
     # Do not send empty values because they would otherwise cause endless PATCH loops.
@@ -786,6 +810,18 @@ def event_differences(existing: dict, desired: dict) -> List[str]:
 
 
 def equivalent_event(existing: dict, desired: dict) -> bool:
+    existing_private = existing.get("extendedProperties", {}).get("private", {}) or {}
+    desired_private = desired.get("extendedProperties", {}).get("private", {}) or {}
+    existing_fingerprint = existing_private.get("syncFingerprint")
+    desired_fingerprint = desired_private.get("syncFingerprint")
+
+    # Once an event has a fingerprint, use it as the primary idempotency key.
+    # This avoids endless PATCH loops caused by calendar-specific normalization of
+    # descriptions, end values, or reminders in Google API responses.
+    if existing_fingerprint and desired_fingerprint:
+        return existing_fingerprint == desired_fingerprint
+
+    # Legacy events without a fingerprint are compared once and then migrated by PATCH.
     return not event_differences(existing, desired)
 
 
@@ -864,21 +900,32 @@ def sync_target_once(config: Config, target: SyncTarget, service) -> None:
             if existing is None:
                 create_event(service, config, target, body)
             else:
-                differences = event_differences(existing, body)
-                if differences:
-                    logging.info(
-                        "[%s] Event differs for source key %s; changed fields: %s",
-                        target.target_id,
-                        plan.source_key,
-                        ", ".join(differences),
-                    )
-                    patch_event(service, config, target, existing["id"], body)
-                else:
+                existing_private = existing.get("extendedProperties", {}).get("private", {}) or {}
+                has_fingerprint = bool(existing_private.get("syncFingerprint"))
+
+                if equivalent_event(existing, body):
                     logging.debug(
                         "[%s] Event already up to date for source key %s",
                         target.target_id,
                         plan.source_key,
                     )
+                else:
+                    differences = event_differences(existing, body)
+                    if has_fingerprint:
+                        logging.info(
+                            "[%s] Event fingerprint changed for source key %s; changed fields: %s",
+                            target.target_id,
+                            plan.source_key,
+                            ", ".join(differences) if differences else "fingerprint",
+                        )
+                    else:
+                        logging.info(
+                            "[%s] Migrating legacy event without fingerprint for source key %s; changed fields: %s",
+                            target.target_id,
+                            plan.source_key,
+                            ", ".join(differences) if differences else "metadata",
+                        )
+                    patch_event(service, config, target, existing["id"], body)
 
     for key, event in existing_events.items():
         if key not in planned_keys:
