@@ -1,0 +1,11 @@
+services:
+  tasksyncer:
+    build: .
+    container_name: tasksyncer
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./secrets:/app/secrets:ro
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
