@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Project: Nextcloud Task to Google Calendar Sync
-Version: 0.1.2
+Version: 0.2.0
 Synopsis:
-    One-way synchronizes VTODO tasks from one Nextcloud CalDAV task list into
-    one shared Google Calendar as normal calendar events.
+    One-way synchronizes VTODO tasks from one shared and up to two optional
+    personal Nextcloud CalDAV task lists into corresponding Google Calendars.
 Description:
     Nextcloud remains the authoritative task backend. Google Calendar is used
     only as a shared visibility and reminder layer. The script creates,
@@ -12,8 +12,9 @@ Description:
     Mapping is stored in Google Calendar extendedProperties.private, so no
     separate database is required.
 
-Supported behavior in version 0.1.2:
-    - Reads one specific Nextcloud CalDAV task list via a WebDAV REPORT request.
+Supported behavior in version 0.2.0:
+    - Reads one shared and up to two optional personal Nextcloud CalDAV task lists.
+    - Uses an independent Nextcloud URL/login and Google Calendar per sync target.
     - Parses VTODO entries.
     - Creates Google Calendar events for tasks with due dates.
     - Preserves VTODO DUE/DTSTART time in Google Calendar events.
@@ -53,7 +54,7 @@ from icalendar import Calendar
 
 APP_NAME = "nextcloud-task-sync"
 APP_SOURCE = "nextcloud-task-google-calendar-sync"
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.2.0"
 
 NS = {
     "d": "DAV:",
@@ -69,12 +70,19 @@ STATUS_DEFINITIONS = {
 
 
 @dataclass(frozen=True)
-class Config:
+class SyncTarget:
+    target_id: str
+    display_name: str
     nc_caldav_url: str
     nc_username: str
     nc_password: str
-    google_service_account_file: str
     google_calendar_id: str
+
+
+@dataclass(frozen=True)
+class Config:
+    targets: Tuple[SyncTarget, ...]
+    google_service_account_file: str
     timezone_name: str
     sync_interval_seconds: int
     default_event_time: str
@@ -124,6 +132,8 @@ class TaskItem:
 class EventPlan:
     source_key: str
     task_uid: str
+    target_id: str
+    target_name: str
     summary: str
     description: str
     start: datetime
@@ -147,13 +157,91 @@ def getenv_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def optional_value(name: str) -> Optional[str]:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    return value.strip()
+
+
+def load_sync_target(
+    target_id: str,
+    display_name: str,
+    prefix: str,
+    *,
+    enabled_default: bool = False,
+    legacy_shared: bool = False,
+) -> Optional[SyncTarget]:
+    enabled_name = f"{prefix}_ENABLED"
+    enabled = getenv_bool(enabled_name, enabled_default)
+
+    if legacy_shared:
+        caldav_url = optional_value(f"{prefix}_NC_CALDAV_URL") or optional_value("NC_CALDAV_URL")
+        username = optional_value(f"{prefix}_NC_USERNAME") or optional_value("NC_USERNAME")
+        password = optional_value(f"{prefix}_NC_PASSWORD") or optional_value("NC_PASSWORD")
+        calendar_id = optional_value(f"{prefix}_GOOGLE_CALENDAR_ID") or optional_value("GOOGLE_CALENDAR_ID")
+    else:
+        caldav_url = optional_value(f"{prefix}_NC_CALDAV_URL")
+        username = optional_value(f"{prefix}_NC_USERNAME")
+        password = optional_value(f"{prefix}_NC_PASSWORD")
+        calendar_id = optional_value(f"{prefix}_GOOGLE_CALENDAR_ID")
+
+    configured_values = [caldav_url, username, password, calendar_id]
+    if not enabled and not any(configured_values):
+        return None
+    if not enabled and any(configured_values):
+        logging.warning("%s has values configured but %s=false; target is disabled", display_name, enabled_name)
+        return None
+
+    missing = []
+    if not caldav_url:
+        missing.append(f"{prefix}_NC_CALDAV_URL")
+    if not username:
+        missing.append(f"{prefix}_NC_USERNAME")
+    if not password:
+        missing.append(f"{prefix}_NC_PASSWORD")
+    if not calendar_id:
+        missing.append(f"{prefix}_GOOGLE_CALENDAR_ID")
+    if missing:
+        raise RuntimeError(f"Enabled sync target '{target_id}' is incomplete. Missing: {', '.join(missing)}")
+
+    return SyncTarget(
+        target_id=target_id,
+        display_name=os.getenv(f"{prefix}_NAME", display_name),
+        nc_caldav_url=caldav_url.rstrip("/") + "/",
+        nc_username=username,
+        nc_password=password,
+        google_calendar_id=calendar_id,
+    )
+
+
 def load_config() -> Config:
+    targets: List[SyncTarget] = []
+
+    shared = load_sync_target(
+        target_id="shared",
+        display_name="Shared tasks",
+        prefix="SHARED",
+        enabled_default=True,
+        legacy_shared=True,
+    )
+    if shared:
+        targets.append(shared)
+
+    for target_id, display_name, prefix in (
+        ("personal1", "Personal tasks 1", "PERSONAL1"),
+        ("personal2", "Personal tasks 2", "PERSONAL2"),
+    ):
+        target = load_sync_target(target_id, display_name, prefix, enabled_default=False)
+        if target:
+            targets.append(target)
+
+    if not targets:
+        raise RuntimeError("No sync target is enabled and fully configured")
+
     return Config(
-        nc_caldav_url=getenv_required("NC_CALDAV_URL").rstrip("/") + "/",
-        nc_username=getenv_required("NC_USERNAME"),
-        nc_password=getenv_required("NC_PASSWORD"),
+        targets=tuple(targets),
         google_service_account_file=getenv_required("GOOGLE_SERVICE_ACCOUNT_FILE"),
-        google_calendar_id=getenv_required("GOOGLE_CALENDAR_ID"),
         timezone_name=os.getenv("TZ", "Europe/Berlin"),
         sync_interval_seconds=int(os.getenv("SYNC_INTERVAL_SECONDS", "600")),
         default_event_time=os.getenv("DEFAULT_EVENT_TIME", "08:00"),
@@ -194,7 +282,7 @@ def build_google_calendar_service(config: Config):
     return build("calendar", "v3", credentials=credentials, cache_discovery=False)
 
 
-def fetch_nextcloud_vtodos(config: Config) -> Iterable[Tuple[Optional[str], str]]:
+def fetch_nextcloud_vtodos(target: SyncTarget) -> Iterable[Tuple[Optional[str], str]]:
     report_body = """<?xml version="1.0" encoding="utf-8" ?>
 <cal:calendar-query xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
   <d:prop>
@@ -210,10 +298,10 @@ def fetch_nextcloud_vtodos(config: Config) -> Iterable[Tuple[Optional[str], str]
 """
     response = requests.request(
         "REPORT",
-        config.nc_caldav_url,
+        target.nc_caldav_url,
         data=report_body.encode("utf-8"),
         headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
-        auth=(config.nc_username, config.nc_password),
+        auth=(target.nc_username, target.nc_password),
         timeout=60,
     )
     if response.status_code not in {207, 200}:
@@ -423,6 +511,7 @@ def event_time_from_task(task: TaskItem, original_due_dt: datetime, fallback_tim
 def build_single_event_plan(
     task: TaskItem,
     config: Config,
+    target: SyncTarget,
     local_tz,
     source_key: str,
     original_due_dt: datetime,
@@ -449,6 +538,7 @@ def build_single_event_plan(
     priority_bucket_name, priority_label = priority_bucket(task.priority)
     lines = [
         "Source: Nextcloud Tasks",
+        f"Sync target: {target.display_name} ({target.target_id})",
         f"Sync application: {APP_SOURCE} {APP_VERSION}",
         f"Nextcloud UID: {task.uid}",
         f"Source key: {source_key}",
@@ -471,6 +561,8 @@ def build_single_event_plan(
     return EventPlan(
         source_key=source_key,
         task_uid=task.uid,
+        target_id=target.target_id,
+        target_name=target.display_name,
         summary=summary,
         description="\n".join(lines),
         start=start,
@@ -492,7 +584,7 @@ def parse_rrule_set(task: TaskItem, base_dt: datetime, local_tz):
     return ruleset
 
 
-def build_event_plans(task: TaskItem, config: Config, local_tz) -> List[EventPlan]:
+def build_event_plans(task: TaskItem, config: Config, target: SyncTarget, local_tz) -> List[EventPlan]:
     today = datetime.now(local_tz).date()
     fallback_time = parse_default_time(config.default_event_time)
     base_dt, base_has_time = effective_due_datetime(task, today, fallback_time, local_tz)
@@ -503,7 +595,7 @@ def build_event_plans(task: TaskItem, config: Config, local_tz) -> List[EventPla
 
     if not task.rrule_text:
         source_key = task.uid if task.recurrence_id is None else f"{task.uid}::{task.recurrence_id.isoformat()}"
-        plan = build_single_event_plan(task, config, local_tz, source_key, base_dt, base_has_time, task.recurrence_id.isoformat() if task.recurrence_id else None)
+        plan = build_single_event_plan(task, config, target, local_tz, source_key, base_dt, base_has_time, task.recurrence_id.isoformat() if task.recurrence_id else None)
         return [plan] if plan else []
 
     # Recurring VTODOs are expanded into a bounded occurrence window.
@@ -531,6 +623,7 @@ def build_event_plans(task: TaskItem, config: Config, local_tz) -> List[EventPla
         plan = build_single_event_plan(
             task=task,
             config=config,
+            target=target,
             local_tz=local_tz,
             source_key=source_key,
             original_due_dt=occ_local,
@@ -553,6 +646,8 @@ def event_body_from_plan(plan: EventPlan, config: Config) -> dict:
                 "source": APP_SOURCE,
                 "sourceKey": plan.source_key,
                 "nextcloudTaskUid": plan.task_uid,
+                "syncTarget": plan.target_id,
+                "syncTargetName": plan.target_name,
                 "recurrenceInstance": plan.recurrence_instance or "",
                 "managedBy": APP_NAME,
             }
@@ -566,14 +661,14 @@ def event_body_from_plan(plan: EventPlan, config: Config) -> dict:
     }
 
 
-def list_managed_google_events(service, config: Config) -> Dict[str, dict]:
+def list_managed_google_events(service, target: SyncTarget) -> Dict[str, dict]:
     events_by_key: Dict[str, dict] = {}
     page_token = None
     while True:
         result = (
             service.events()
             .list(
-                calendarId=config.google_calendar_id,
+                calendarId=target.google_calendar_id,
                 privateExtendedProperty=f"source={APP_SOURCE}",
                 showDeleted=False,
                 maxResults=2500,
@@ -583,6 +678,12 @@ def list_managed_google_events(service, config: Config) -> Dict[str, dict]:
         )
         for event in result.get("items", []):
             private_props = event.get("extendedProperties", {}).get("private", {})
+            event_target = private_props.get("syncTarget")
+            # Adopt legacy v0.1.x events without syncTarget only for the shared target.
+            if event_target not in {target.target_id, None, ""}:
+                continue
+            if not event_target and target.target_id != "shared":
+                continue
             key = private_props.get("sourceKey") or private_props.get("nextcloudTaskUid")
             if key:
                 events_by_key[key] = event
@@ -605,28 +706,28 @@ def equivalent_event(existing: dict, desired: dict) -> bool:
     return True
 
 
-def create_event(service, config: Config, body: dict) -> None:
+def create_event(service, config: Config, target: SyncTarget, body: dict) -> None:
     if config.dry_run:
         logging.info("DRY RUN: would create event: %s", body["summary"])
         return
-    created = service.events().insert(calendarId=config.google_calendar_id, body=body).execute()
+    created = service.events().insert(calendarId=target.google_calendar_id, body=body).execute()
     logging.info("Created Google Calendar event: %s", created.get("id"))
 
 
-def patch_event(service, config: Config, event_id: str, body: dict) -> None:
+def patch_event(service, config: Config, target: SyncTarget, event_id: str, body: dict) -> None:
     if config.dry_run:
         logging.info("DRY RUN: would patch event %s: %s", event_id, body["summary"])
         return
-    service.events().patch(calendarId=config.google_calendar_id, eventId=event_id, body=body).execute()
+    service.events().patch(calendarId=target.google_calendar_id, eventId=event_id, body=body).execute()
     logging.info("Updated Google Calendar event: %s", event_id)
 
 
-def delete_event(service, config: Config, event_id: str) -> None:
+def delete_event(service, config: Config, target: SyncTarget, event_id: str) -> None:
     if config.dry_run:
         logging.info("DRY RUN: would delete event: %s", event_id)
         return
     try:
-        service.events().delete(calendarId=config.google_calendar_id, eventId=event_id).execute()
+        service.events().delete(calendarId=target.google_calendar_id, eventId=event_id).execute()
         logging.info("Deleted Google Calendar event: %s", event_id)
     except HttpError as exc:
         if exc.resp.status == 410:
@@ -643,28 +744,27 @@ def should_delete_for_status(task: TaskItem, config: Config) -> bool:
     return False
 
 
-def sync_once(config: Config, service) -> None:
+def sync_target_once(config: Config, target: SyncTarget, service) -> None:
     local_tz = tz.gettz(config.timezone_name)
     if local_tz is None:
         raise RuntimeError(f"Invalid timezone: {config.timezone_name}")
 
-    logging.info("Fetching Nextcloud VTODOs from %s", config.nc_caldav_url)
-    tasks = parse_tasks(fetch_nextcloud_vtodos(config), local_tz)
-    logging.info("Fetched %d Nextcloud task component(s)", len(tasks))
+    logging.info("[%s] Fetching Nextcloud VTODOs from %s", target.target_id, target.nc_caldav_url)
+    tasks = parse_tasks(fetch_nextcloud_vtodos(target), local_tz)
+    logging.info("[%s] Fetched %d Nextcloud task component(s)", target.target_id, len(tasks))
 
-    existing_events = list_managed_google_events(service, config)
-    logging.info("Fetched %d managed Google Calendar event(s)", len(existing_events))
+    existing_events = list_managed_google_events(service, target)
+    logging.info("[%s] Fetched %d managed Google Calendar event(s)", target.target_id, len(existing_events))
 
     planned_keys: Set[str] = set()
 
     for _, task in tasks.items():
-        plans = build_event_plans(task, config, local_tz)
+        plans = build_event_plans(task, config, target, local_tz)
         if not plans:
-            # Remove any old non-recurring event for the task if it became undated.
             old = existing_events.get(task.uid)
             if old:
-                logging.info("Task has no plannable due date; deleting existing event for UID %s", task.uid)
-                delete_event(service, config, old["id"])
+                logging.info("[%s] Task has no plannable due date; deleting existing event for UID %s", target.target_id, task.uid)
+                delete_event(service, config, target, old["id"])
             continue
 
         for plan in plans:
@@ -672,30 +772,46 @@ def sync_once(config: Config, service) -> None:
 
             if should_delete_for_status(task, config):
                 if existing:
-                    delete_event(service, config, existing["id"])
+                    delete_event(service, config, target, existing["id"])
                 continue
 
             planned_keys.add(plan.source_key)
             body = event_body_from_plan(plan, config)
 
             if existing is None:
-                create_event(service, config, body)
+                create_event(service, config, target, body)
             elif not equivalent_event(existing, body):
-                patch_event(service, config, existing["id"], body)
+                patch_event(service, config, target, existing["id"], body)
             else:
-                logging.debug("Event already up to date for source key %s", plan.source_key)
+                logging.debug("[%s] Event already up to date for source key %s", target.target_id, plan.source_key)
 
     for key, event in existing_events.items():
         if key not in planned_keys:
-            delete_event(service, config, event["id"])
+            delete_event(service, config, target, event["id"])
 
-    logging.info("Sync run completed")
+    logging.info("[%s] Sync run completed", target.target_id)
+
+
+def sync_all_targets(config: Config, service) -> None:
+    failures = 0
+    for target in config.targets:
+        try:
+            sync_target_once(config, target, service)
+        except Exception as exc:
+            failures += 1
+            logging.exception("[%s] Sync target failed: %s", target.target_id, exc)
+    if failures:
+        logging.error("Sync cycle completed with %d failed target(s) out of %d", failures, len(config.targets))
+    else:
+        logging.info("Sync cycle completed successfully for %d target(s)", len(config.targets))
 
 
 def main() -> int:
     setup_logging()
     config = load_config()
     logging.info("Starting %s version %s", APP_SOURCE, APP_VERSION)
+
+    logging.info("Configured sync targets: %s", ", ".join(f"{t.target_id}={t.display_name}" for t in config.targets))
 
     if config.dry_run:
         logging.warning("DRY_RUN is enabled; no Google Calendar changes will be written")
@@ -704,7 +820,7 @@ def main() -> int:
 
     while True:
         try:
-            sync_once(config, service)
+            sync_all_targets(config, service)
         except Exception as exc:
             logging.exception("Sync run failed: %s", exc)
 

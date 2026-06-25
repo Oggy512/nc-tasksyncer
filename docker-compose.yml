@@ -1,7 +1,7 @@
 services:
-  tasksyncer:
+  nextcloud-task-google-calendar-sync:
     build: .
-    container_name: tasksyncer
+    container_name: nextcloud-task-google-calendar-sync
     restart: unless-stopped
     env_file:
       - .env
